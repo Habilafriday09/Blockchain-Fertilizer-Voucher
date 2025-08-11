@@ -9,6 +9,9 @@
 (define-constant ERR_SEASON_NOT_ACTIVE (err u107))
 (define-constant ERR_DEALER_NOT_AUTHORIZED (err u108))
 (define-constant ERR_VOUCHER_LIMIT_EXCEEDED (err u109))
+(define-constant ERR_TRANSFER_TO_SELF (err u110))
+(define-constant ERR_RECIPIENT_NOT_VERIFIED (err u111))
+(define-constant ERR_RECIPIENT_LIMIT_EXCEEDED (err u112))
 
 (define-data-var contract-admin principal CONTRACT_OWNER)
 (define-data-var total-vouchers-issued uint u0)
@@ -76,6 +79,18 @@
     }
 )
 
+(define-map voucher-transfers
+    { transfer-id: uint }
+    {
+        voucher-id: uint,
+        from-farmer: principal,
+        to-farmer: principal,
+        transferred-at: uint,
+    }
+)
+
+(define-data-var total-transfers uint u0)
+
 (define-read-only (get-contract-info)
     {
         admin: (var-get contract-admin),
@@ -106,6 +121,10 @@
 
 (define-read-only (get-season-statistics (season uint))
     (map-get? season-stats { season: season })
+)
+
+(define-read-only (get-transfer-details (transfer-id uint))
+    (map-get? voucher-transfers { transfer-id: transfer-id })
 )
 
 (define-read-only (is-voucher-valid (voucher-id uint))
@@ -532,6 +551,67 @@
     )
 )
 
+(define-public (transfer-voucher
+        (voucher-id uint)
+        (recipient principal)
+    )
+    (let ((voucher-data (unwrap! (map-get? vouchers { voucher-id: voucher-id })
+            ERR_VOUCHER_NOT_FOUND
+        )))
+        (begin
+            (asserts! (is-eq tx-sender (get farmer voucher-data))
+                ERR_NOT_AUTHORIZED
+            )
+            (asserts! (not (is-eq tx-sender recipient)) ERR_TRANSFER_TO_SELF)
+            (asserts! (not (get redeemed voucher-data))
+                ERR_VOUCHER_ALREADY_REDEEMED
+            )
+            (asserts! (< stacks-block-height (get expires-at voucher-data))
+                ERR_VOUCHER_EXPIRED
+            )
+            (asserts! (validate-farmer recipient) ERR_RECIPIENT_NOT_VERIFIED)
+
+            (let ((recipient-data (unwrap! (map-get? farmers { farmer-address: recipient })
+                    ERR_RECIPIENT_NOT_VERIFIED
+                )))
+                (asserts!
+                    (< (get vouchers-received recipient-data)
+                        (var-get max-vouchers-per-farmer)
+                    )
+                    ERR_RECIPIENT_LIMIT_EXCEEDED
+                )
+
+                (map-set farmers { farmer-address: recipient }
+                    (merge recipient-data { vouchers-received: (+ (get vouchers-received recipient-data) u1) })
+                )
+            )
+
+            (let ((sender-data (unwrap! (map-get? farmers { farmer-address: tx-sender })
+                    ERR_INVALID_FARMER
+                )))
+                (map-set farmers { farmer-address: tx-sender }
+                    (merge sender-data { vouchers-received: (- (get vouchers-received sender-data) u1) })
+                )
+            )
+
+            (map-set vouchers { voucher-id: voucher-id }
+                (merge voucher-data { farmer: recipient })
+            )
+
+            (let ((transfer-id (+ (var-get total-transfers) u1)))
+                (map-set voucher-transfers { transfer-id: transfer-id } {
+                    voucher-id: voucher-id,
+                    from-farmer: tx-sender,
+                    to-farmer: recipient,
+                    transferred-at: stacks-block-height,
+                })
+                (var-set total-transfers transfer-id)
+                (ok transfer-id)
+            )
+        )
+    )
+)
+
 (define-read-only (get-contract-statistics)
     (ok {
         total-vouchers-issued: (var-get total-vouchers-issued),
@@ -545,5 +625,6 @@
         current-season: (var-get current-season),
         season-active: (var-get season-active),
         current-block: stacks-block-height,
+        total-transfers: (var-get total-transfers),
     })
 )
