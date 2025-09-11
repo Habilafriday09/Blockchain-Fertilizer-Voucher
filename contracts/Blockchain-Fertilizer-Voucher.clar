@@ -12,6 +12,8 @@
 (define-constant ERR_TRANSFER_TO_SELF (err u110))
 (define-constant ERR_RECIPIENT_NOT_VERIFIED (err u111))
 (define-constant ERR_RECIPIENT_LIMIT_EXCEEDED (err u112))
+(define-constant ERR_INVALID_YIELD (err u113))
+(define-constant ERR_YIELD_ALREADY_REPORTED (err u114))
 
 (define-data-var contract-admin principal CONTRACT_OWNER)
 (define-data-var total-vouchers-issued uint u0)
@@ -19,6 +21,8 @@
 (define-data-var current-season uint u1)
 (define-data-var season-active bool true)
 (define-data-var max-vouchers-per-farmer uint u5)
+(define-data-var base-voucher-limit uint u5)
+(define-data-var reputation-multiplier uint u20)
 
 (define-map vouchers
     { voucher-id: uint }
@@ -45,6 +49,9 @@
         vouchers-redeemed: uint,
         season: uint,
         verified: bool,
+        reputation-score: uint,
+        total-yield-reported: uint,
+        seasons-participated: uint,
     }
 )
 
@@ -91,6 +98,20 @@
 
 (define-data-var total-transfers uint u0)
 
+(define-map farmer-yields
+    {
+        farmer: principal,
+        season: uint,
+    }
+    {
+        crop-type: (string-ascii 50),
+        yield-amount: uint,
+        fertilizer-used: (string-ascii 50),
+        reported-at: uint,
+        verified: bool,
+    }
+)
+
 (define-read-only (get-contract-info)
     {
         admin: (var-get contract-admin),
@@ -99,6 +120,8 @@
         current-season: (var-get current-season),
         season-active: (var-get season-active),
         max-vouchers-per-farmer: (var-get max-vouchers-per-farmer),
+        base-voucher-limit: (var-get base-voucher-limit),
+        reputation-multiplier: (var-get reputation-multiplier),
         current-block: stacks-block-height,
     }
 )
@@ -127,6 +150,16 @@
     (map-get? voucher-transfers { transfer-id: transfer-id })
 )
 
+(define-read-only (get-farmer-yield
+        (farmer principal)
+        (season uint)
+    )
+    (map-get? farmer-yields {
+        farmer: farmer,
+        season: season,
+    })
+)
+
 (define-read-only (is-voucher-valid (voucher-id uint))
     (match (map-get? vouchers { voucher-id: voucher-id })
         voucher-data (and
@@ -148,6 +181,22 @@
                 (subsidy-rate (get subsidy-percentage inventory-data))
             )
             (/ (* (* amount price-per-unit) subsidy-rate) u100)
+        )
+        u0
+    )
+)
+
+(define-read-only (calculate-farmer-voucher-limit (farmer principal))
+    (match (map-get? farmers { farmer-address: farmer })
+        farmer-data (let (
+                (reputation (get reputation-score farmer-data))
+                (base-limit (var-get base-voucher-limit))
+                (multiplier (var-get reputation-multiplier))
+            )
+            (if (> reputation u0)
+                (+ base-limit (/ (* reputation multiplier) u100))
+                base-limit
+            )
         )
         u0
     )
@@ -179,6 +228,33 @@
     (+ (var-get total-vouchers-issued) u1)
 )
 
+(define-private (update-farmer-reputation
+        (farmer principal)
+        (yield-score uint)
+    )
+    (match (map-get? farmers { farmer-address: farmer })
+        farmer-data (let (
+                (current-reputation (get reputation-score farmer-data))
+                (seasons-count (get seasons-participated farmer-data))
+                (new-reputation (if (is-eq seasons-count u0)
+                    yield-score
+                    (/ (+ (* current-reputation seasons-count) yield-score)
+                        (+ seasons-count u1)
+                    )
+                ))
+            )
+            (map-set farmers { farmer-address: farmer }
+                (merge farmer-data {
+                    reputation-score: new-reputation,
+                    total-yield-reported: (+ (get total-yield-reported farmer-data) yield-score),
+                    seasons-participated: (+ seasons-count u1),
+                })
+            )
+        )
+        false
+    )
+)
+
 (define-public (set-admin (new-admin principal))
     (begin
         (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
@@ -203,6 +279,9 @@
             vouchers-redeemed: u0,
             season: (var-get current-season),
             verified: true,
+            reputation-score: u50,
+            total-yield-reported: u0,
+            seasons-participated: u0,
         })
         (ok true)
     )
@@ -270,11 +349,11 @@
             (asserts! (> amount u0) ERR_INVALID_AMOUNT)
 
             (let ((farmer-data (unwrap-panic (map-get? farmers { farmer-address: farmer }))))
-                (asserts!
-                    (< (get vouchers-received farmer-data)
-                        (var-get max-vouchers-per-farmer)
+                (let ((dynamic-limit (calculate-farmer-voucher-limit farmer)))
+                    (asserts!
+                        (< (get vouchers-received farmer-data) dynamic-limit)
+                        ERR_VOUCHER_LIMIT_EXCEEDED
                     )
-                    ERR_VOUCHER_LIMIT_EXCEEDED
                 )
 
                 (map-set farmers { farmer-address: farmer }
@@ -474,6 +553,9 @@
                 vouchers-redeemed: u0,
                 season: (var-get current-season),
                 verified: true,
+                reputation-score: u50,
+                total-yield-reported: u0,
+                seasons-participated: u0,
             })
             (ok true)
         )
@@ -484,13 +566,15 @@
 
 (define-public (get-farmer-voucher-count (farmer principal))
     (match (map-get? farmers { farmer-address: farmer })
-        farmer-data (ok {
-            vouchers-received: (get vouchers-received farmer-data),
-            vouchers-redeemed: (get vouchers-redeemed farmer-data),
-            remaining-limit: (- (var-get max-vouchers-per-farmer)
-                (get vouchers-received farmer-data)
-            ),
-        })
+        farmer-data (let ((dynamic-limit (calculate-farmer-voucher-limit farmer)))
+            (ok {
+                vouchers-received: (get vouchers-received farmer-data),
+                vouchers-redeemed: (get vouchers-redeemed farmer-data),
+                remaining-limit: (- dynamic-limit (get vouchers-received farmer-data)),
+                reputation-score: (get reputation-score farmer-data),
+                dynamic-voucher-limit: dynamic-limit,
+            })
+        )
         ERR_INVALID_FARMER
     )
 )
@@ -574,11 +658,11 @@
             (let ((recipient-data (unwrap! (map-get? farmers { farmer-address: recipient })
                     ERR_RECIPIENT_NOT_VERIFIED
                 )))
-                (asserts!
-                    (< (get vouchers-received recipient-data)
-                        (var-get max-vouchers-per-farmer)
+                (let ((recipient-limit (calculate-farmer-voucher-limit recipient)))
+                    (asserts!
+                        (< (get vouchers-received recipient-data) recipient-limit)
+                        ERR_RECIPIENT_LIMIT_EXCEEDED
                     )
-                    ERR_RECIPIENT_LIMIT_EXCEEDED
                 )
 
                 (map-set farmers { farmer-address: recipient }
@@ -626,5 +710,98 @@
         season-active: (var-get season-active),
         current-block: stacks-block-height,
         total-transfers: (var-get total-transfers),
+        base-voucher-limit: (var-get base-voucher-limit),
+        reputation-multiplier: (var-get reputation-multiplier),
     })
+)
+
+(define-public (report-yield
+        (crop-type (string-ascii 50))
+        (yield-amount uint)
+        (fertilizer-used (string-ascii 50))
+    )
+    (let (
+            (farmer tx-sender)
+            (current-season-num (var-get current-season))
+        )
+        (begin
+            (asserts! (validate-farmer farmer) ERR_INVALID_FARMER)
+            (asserts! (> yield-amount u0) ERR_INVALID_YIELD)
+            (asserts!
+                (is-none (map-get? farmer-yields {
+                    farmer: farmer,
+                    season: current-season-num,
+                }))
+                ERR_YIELD_ALREADY_REPORTED
+            )
+
+            (map-set farmer-yields {
+                farmer: farmer,
+                season: current-season-num,
+            } {
+                crop-type: crop-type,
+                yield-amount: yield-amount,
+                fertilizer-used: fertilizer-used,
+                reported-at: stacks-block-height,
+                verified: false,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (verify-yield
+        (farmer principal)
+        (season uint)
+        (yield-score uint)
+    )
+    (begin
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (<= yield-score u100) ERR_INVALID_YIELD)
+
+        (match (map-get? farmer-yields {
+            farmer: farmer,
+            season: season,
+        })
+            yield-data (begin
+                (map-set farmer-yields {
+                    farmer: farmer,
+                    season: season,
+                }
+                    (merge yield-data { verified: true })
+                )
+                (update-farmer-reputation farmer yield-score)
+                (ok true)
+            )
+            ERR_VOUCHER_NOT_FOUND
+        )
+    )
+)
+
+(define-public (update-reputation-settings
+        (new-base-limit uint)
+        (new-multiplier uint)
+    )
+    (begin
+        (asserts! (is-admin tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (and (> new-base-limit u0) (> new-multiplier u0))
+            ERR_INVALID_AMOUNT
+        )
+        (var-set base-voucher-limit new-base-limit)
+        (var-set reputation-multiplier new-multiplier)
+        (ok true)
+    )
+)
+
+(define-read-only (get-farmer-reputation-details (farmer principal))
+    (match (map-get? farmers { farmer-address: farmer })
+        farmer-data (ok {
+            reputation-score: (get reputation-score farmer-data),
+            total-yield-reported: (get total-yield-reported farmer-data),
+            seasons-participated: (get seasons-participated farmer-data),
+            current-voucher-limit: (calculate-farmer-voucher-limit farmer),
+            base-limit: (var-get base-voucher-limit),
+        })
+        ERR_INVALID_FARMER
+    )
 )
