@@ -1,7 +1,3 @@
-;; Fertilizer Voucher Management System
-;; Clarity v3 Smart Contract
-
-;; Error Constants
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-FARMER-EXISTS (err u101))
 (define-constant ERR-FARMER-NOT-FOUND (err u102))
@@ -11,14 +7,12 @@
 (define-constant ERR-ALREADY-VERIFIED (err u106))
 (define-constant ERR-NOT-VERIFIED (err u107))
 
-;; Contract Owner
 (define-constant CONTRACT-OWNER tx-sender)
 
-;; Data Variables
 (define-data-var total-vouchers-issued uint u0)
 (define-data-var total-vouchers-redeemed uint u0)
+(define-data-var total-voucher-transactions uint u0)
 
-;; Data Maps
 (define-map farmers
     principal
     {
@@ -26,7 +20,7 @@
         voucher-balance: uint,
         total-received: uint,
         total-redeemed: uint,
-        registration-block: uint
+        registration-block: uint,
     }
 )
 
@@ -37,18 +31,37 @@
         amount: uint,
         transaction-type: (string-ascii 20),
         stacks-block-height: uint,
-        timestamp: uint
+        timestamp: uint,
     }
 )
 
-(define-map authorized-issuers principal bool)
+(define-map authorized-issuers
+    principal
+    bool
+)
 
-;; Private Functions
 (define-private (is-authorized-issuer (issuer principal))
     (default-to false (map-get? authorized-issuers issuer))
 )
 
-;; Public Functions - Farmer Management
+(define-private (record-transaction
+        (farmer principal)
+        (amount uint)
+        (tx-type (string-ascii 20))
+    )
+    (let ((tx-id (var-get total-voucher-transactions)))
+        (map-set voucher-transactions tx-id {
+            farmer: farmer,
+            amount: amount,
+            transaction-type: tx-type,
+            stacks-block-height: stacks-block-height,
+            timestamp: stacks-block-height,
+        })
+        (var-set total-voucher-transactions (+ tx-id u1))
+        tx-id
+    )
+)
+
 (define-public (register-farmer (farmer principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
@@ -58,7 +71,7 @@
             voucher-balance: u0,
             total-received: u0,
             total-redeemed: u0,
-            registration-block: stacks-block-height
+            registration-block: stacks-block-height,
         }))
     )
 )
@@ -71,63 +84,87 @@
     )
 )
 
-;; Public Functions - Voucher Issuance
-(define-public (issue-vouchers (farmer principal) (amount uint))
-    (let (
-        (farmer-data (unwrap! (map-get? farmers farmer) ERR-FARMER-NOT-FOUND))
-        (tx-id (var-get total-vouchers-issued))
+(define-public (issue-vouchers
+        (farmer principal)
+        (amount uint)
     )
-        (asserts! (or (is-eq tx-sender CONTRACT-OWNER) (is-authorized-issuer tx-sender)) ERR-NOT-AUTHORIZED)
+    (let (
+            (farmer-data (unwrap! (map-get? farmers farmer) ERR-FARMER-NOT-FOUND))
+            (tx-id (record-transaction farmer amount "ISSUE"))
+        )
+        (asserts!
+            (or (is-eq tx-sender CONTRACT-OWNER) (is-authorized-issuer tx-sender))
+            ERR-NOT-AUTHORIZED
+        )
         (asserts! (get verified farmer-data) ERR-NOT-VERIFIED)
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-        
-        (map-set farmers farmer (merge farmer-data {
-            voucher-balance: (+ (get voucher-balance farmer-data) amount),
-            total-received: (+ (get total-received farmer-data) amount)
-        }))
-        
-        (map-set voucher-transactions tx-id {
-            farmer: farmer,
-            amount: amount,
-            transaction-type: "ISSUE",
-            stacks-block-height: stacks-block-height,
-            timestamp: stacks-block-height
-        })
-        
-        (var-set total-vouchers-issued (+ tx-id u1))
+
+        (map-set farmers farmer
+            (merge farmer-data {
+                voucher-balance: (+ (get voucher-balance farmer-data) amount),
+                total-received: (+ (get total-received farmer-data) amount),
+            })
+        )
+
+        (var-set total-vouchers-issued (+ (var-get total-vouchers-issued) u1))
         (ok amount)
     )
 )
 
-;; Public Functions - Voucher Redemption
+(define-public (transfer-vouchers
+        (recipient principal)
+        (amount uint)
+    )
+    (let (
+            (sender-data (unwrap! (map-get? farmers tx-sender) ERR-FARMER-NOT-FOUND))
+            (recipient-data (unwrap! (map-get? farmers recipient) ERR-FARMER-NOT-FOUND))
+            (tx-id (record-transaction tx-sender amount "TRANSFER"))
+        )
+        (asserts! (get verified sender-data) ERR-NOT-VERIFIED)
+        (asserts! (get verified recipient-data) ERR-NOT-VERIFIED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (>= (get voucher-balance sender-data) amount)
+            ERR-INSUFFICIENT-VOUCHERS
+        )
+
+        (map-set farmers tx-sender
+            (merge sender-data { voucher-balance: (- (get voucher-balance sender-data) amount) })
+        )
+
+        (map-set farmers recipient
+            (merge recipient-data {
+                voucher-balance: (+ (get voucher-balance recipient-data) amount),
+                total-received: (+ (get total-received recipient-data) amount),
+            })
+        )
+
+        (ok amount)
+    )
+)
+
 (define-public (redeem-vouchers (amount uint))
     (let (
-        (farmer-data (unwrap! (map-get? farmers tx-sender) ERR-FARMER-NOT-FOUND))
-        (tx-id (var-get total-vouchers-redeemed))
-    )
+            (farmer-data (unwrap! (map-get? farmers tx-sender) ERR-FARMER-NOT-FOUND))
+            (tx-id (record-transaction tx-sender amount "REDEEM"))
+        )
         (asserts! (get verified farmer-data) ERR-NOT-VERIFIED)
-        (asserts! (>= (get voucher-balance farmer-data) amount) ERR-INSUFFICIENT-VOUCHERS)
+        (asserts! (>= (get voucher-balance farmer-data) amount)
+            ERR-INSUFFICIENT-VOUCHERS
+        )
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-        
-        (map-set farmers tx-sender (merge farmer-data {
-            voucher-balance: (- (get voucher-balance farmer-data) amount),
-            total-redeemed: (+ (get total-redeemed farmer-data) amount)
-        }))
-        
-        (map-set voucher-transactions tx-id {
-            farmer: tx-sender,
-            amount: amount,
-            transaction-type: "REDEEM",
-            stacks-block-height: stacks-block-height,
-            timestamp: stacks-block-height
-        })
-        
-        (var-set total-vouchers-redeemed (+ tx-id u1))
+
+        (map-set farmers tx-sender
+            (merge farmer-data {
+                voucher-balance: (- (get voucher-balance farmer-data) amount),
+                total-redeemed: (+ (get total-redeemed farmer-data) amount),
+            })
+        )
+
+        (var-set total-vouchers-redeemed (+ (var-get total-vouchers-redeemed) u1))
         (ok amount)
     )
 )
 
-;; Public Functions - Authorization Management
 (define-public (add-authorized-issuer (issuer principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
@@ -142,7 +179,6 @@
     )
 )
 
-;; Read-Only Functions
 (define-read-only (get-farmer-info (farmer principal))
     (map-get? farmers farmer)
 )
