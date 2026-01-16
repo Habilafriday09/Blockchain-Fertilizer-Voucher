@@ -7,7 +7,6 @@ genesis:
     - name: deployer
       address: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
       balance: "100000000000000"
-      sbtc-balance: "1000000000"
   contracts:
     - costs
     - pox
